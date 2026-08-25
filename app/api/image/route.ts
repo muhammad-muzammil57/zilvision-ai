@@ -4,14 +4,18 @@ import { authOptions } from "@/lib/auth";
 
 // ---------------------------------------------------------------------------
 // Three providers:
-//  1. "free-fast"     -> Pollinations (flux model). No key. Current default.
-//  2. "free-accurate" -> Pollinations (nanobanana model = Google's Gemini
-//                         image model, proxied for free). No key needed,
-//                         much better prompt-following than flux/turbo.
-//  3. "gemini-byok"    -> User's own Gemini API key. We call Google directly
-//                         with the key they typed in. Their own quota/
-//                         credits are used, nothing is billed to us and we
-//                         never store the key server-side.
+//  1. "free-fast"     -> Pollinations (flux model). No key.
+//  2. "free-accurate" -> Pollinations (nanobanana, falling back to gptimage,
+//                         falling back to flux if those are overloaded).
+//                         No key needed, best prompt-following of the free
+//                         tiers.
+//  3. "gemini-byok"    -> User's own Gemini API key, called directly.
+//
+// IMPORTANT: for the Pollinations providers we fetch the image bytes on the
+// server FIRST and check the response is actually an image before ever
+// telling the client "success". This is what stops the broken-image-icon
+// problem: previously we just handed the browser a URL and hoped for the
+// best, so a 429/403/500 from Pollinations rendered as a broken <img>.
 // ---------------------------------------------------------------------------
 
 function aspectRatioFor(width: number, height: number) {
@@ -23,25 +27,67 @@ function aspectRatioFor(width: number, height: number) {
   return "3:4";
 }
 
-async function generateWithPollinations(
+async function fetchPollinationsImage(
   prompt: string,
   width: number,
   height: number,
   seed: number,
-  model: "flux" | "nanobanana"
-) {
+  model: string,
+  timeoutMs = 45_000
+): Promise<string> {
   const base = process.env.POLLINATIONS_BASE_URL || "https://image.pollinations.ai/prompt";
   const encoded = encodeURIComponent(prompt.trim());
-  const imageUrl = `${base}/${encoded}?width=${width}&height=${height}&seed=${seed}&nologo=true&model=${model}`;
-  return imageUrl;
+  const url = `${base}/${encoded}?width=${width}&height=${height}&seed=${seed}&nologo=true&model=${model}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    const contentType = res.headers.get("content-type") || "";
+
+    if (!res.ok || !contentType.startsWith("image/")) {
+      // Pollinations returns JSON/HTML for errors (rate limit, model down, etc).
+      let detail = `status ${res.status}`;
+      try {
+        const text = await res.text();
+        detail = text.slice(0, 200) || detail;
+      } catch {
+        // ignore
+      }
+      throw new Error(`Model "${model}" unavailable right now (${detail}).`);
+    }
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (buffer.length < 500) {
+      throw new Error(`Model "${model}" returned an empty image.`);
+    }
+    return `data:${contentType};base64,${buffer.toString("base64")}`;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function generateWithGemini(
-  prompt: string,
-  width: number,
-  height: number,
-  apiKey: string
-) {
+async function generateFast(prompt: string, width: number, height: number, seed: number) {
+  return fetchPollinationsImage(prompt, width, height, seed, "flux");
+}
+
+async function generateAccurate(prompt: string, width: number, height: number, seed: number) {
+  // Try the strongest prompt-following model first, then degrade gracefully
+  // instead of surfacing a broken image to the user.
+  const chain = ["nanobanana", "gptimage", "flux"];
+  let lastError: unknown;
+  for (const model of chain) {
+    try {
+      return await fetchPollinationsImage(prompt, width, height, seed, model);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("All accurate models are unavailable right now.");
+}
+
+async function generateWithGemini(prompt: string, width: number, height: number, apiKey: string) {
   const model = "gemini-2.5-flash-image";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
@@ -100,6 +146,7 @@ export async function POST(req: NextRequest) {
     }
 
     const seedParam = seed ?? Math.floor(Math.random() * 1_000_000);
+    const cleanPrompt = prompt.trim();
 
     if (provider === "gemini-byok") {
       if (!apiKey || !apiKey.trim()) {
@@ -108,31 +155,22 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
-      const imageUrl = await generateWithGemini(prompt.trim(), width, height, apiKey.trim());
+      const imageUrl = await generateWithGemini(cleanPrompt, width, height, apiKey.trim());
       return NextResponse.json({ imageUrl, provider });
     }
 
     if (provider === "free-accurate") {
-      const imageUrl = await generateWithPollinations(
-        prompt.trim(),
-        width,
-        height,
-        seedParam,
-        "nanobanana"
-      );
+      const imageUrl = await generateAccurate(cleanPrompt, width, height, seedParam);
       return NextResponse.json({ imageUrl, provider });
     }
 
     // default: free-fast
-    const imageUrl = await generateWithPollinations(
-      prompt.trim(),
-      width,
-      height,
-      seedParam,
-      "flux"
-    );
+    const imageUrl = await generateFast(cleanPrompt, width, height, seedParam);
     return NextResponse.json({ imageUrl, provider });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message ?? "Something went wrong." }, { status: 500 });
+    return NextResponse.json(
+      { error: err.message ?? "Something went wrong. Please try again." },
+      { status: 500 }
+    );
   }
 }
