@@ -134,7 +134,7 @@ export default function ChatUI() {
           e.preventDefault();
           send();
         }}
-        className="sticky bottom-4 glass rounded-2xl p-2 flex items-center gap-2"
+        className="sticky bottom-4 glass rounded-2xl p-2 flex items-center gap-2 mt-10"
       >
         <input
           value={input}
