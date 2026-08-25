@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { Sparkles, Loader2, Download, RefreshCcw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Sparkles, Loader2, Download, RefreshCcw, KeyRound, Eye, EyeOff } from "lucide-react";
 
 const RATIOS = [
   { label: "Square", w: 1024, h: 1024 },
@@ -9,22 +9,72 @@ const RATIOS = [
   { label: "Landscape", w: 1216, h: 832 },
 ];
 
+const PROVIDERS = [
+  {
+    id: "free-fast",
+    label: "Fast (Free)",
+    hint: "Quick generations, no API key needed.",
+  },
+  {
+    id: "free-accurate",
+    label: "Accurate (Free)",
+    hint: "Slower but follows your prompt much more closely. No API key needed.",
+  },
+  {
+    id: "gemini-byok",
+    label: "Gemini (Your API Key)",
+    hint: "Uses your own Gemini API key — credits are deducted from your account, not ours.",
+  },
+] as const;
+
+type ProviderId = (typeof PROVIDERS)[number]["id"];
+
+const GEMINI_KEY_STORAGE = "zilvision_gemini_api_key";
+
 export default function ImageGenUI() {
   const [prompt, setPrompt] = useState("");
   const [ratio, setRatio] = useState(RATIOS[0]);
+  const [provider, setProvider] = useState<ProviderId>("free-fast");
+  const [apiKey, setApiKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
   const [loading, setLoading] = useState(false);
   const [images, setImages] = useState<string[]>([]);
   const [error, setError] = useState("");
 
+  // Load a previously saved Gemini key from this browser only (never sent anywhere until Generate is pressed).
+  useEffect(() => {
+    const saved = window.localStorage.getItem(GEMINI_KEY_STORAGE);
+    if (saved) setApiKey(saved);
+  }, []);
+
+  function updateApiKey(value: string) {
+    setApiKey(value);
+    if (value.trim()) {
+      window.localStorage.setItem(GEMINI_KEY_STORAGE, value.trim());
+    } else {
+      window.localStorage.removeItem(GEMINI_KEY_STORAGE);
+    }
+  }
+
   async function generate() {
     if (!prompt.trim() || loading) return;
+    if (provider === "gemini-byok" && !apiKey.trim()) {
+      setError("Add your Gemini API key first, or switch to a free option.");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
       const res = await fetch("/api/image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, width: ratio.w, height: ratio.h }),
+        body: JSON.stringify({
+          prompt,
+          width: ratio.w,
+          height: ratio.h,
+          provider,
+          apiKey: provider === "gemini-byok" ? apiKey.trim() : undefined,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Image generation failed");
@@ -35,6 +85,8 @@ export default function ImageGenUI() {
       setLoading(false);
     }
   }
+
+  const activeProvider = PROVIDERS.find((p) => p.id === provider)!;
 
   return (
     <div className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-8">
@@ -54,6 +106,62 @@ export default function ImageGenUI() {
           placeholder="e.g. A neon-lit cyberpunk street in Lahore at night, cinematic, 4k"
           className="w-full bg-transparent outline-none resize-none text-sm placeholder:text-mist/70"
         />
+
+        {/* Provider selector */}
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-mist">Model</label>
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as ProviderId)}
+            className="w-full sm:w-auto bg-panel border border-line rounded-xl px-3 py-2 text-sm outline-none focus:border-aperture"
+          >
+            {PROVIDERS.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-mist">{activeProvider.hint}</p>
+        </div>
+
+        {/* Gemini API key input, only shown when that provider is selected */}
+        {provider === "gemini-byok" && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-mist flex items-center gap-1.5">
+              <KeyRound className="h-3.5 w-3.5" /> Your Gemini API key
+            </label>
+            <div className="relative">
+              <input
+                type={showKey ? "text" : "password"}
+                value={apiKey}
+                onChange={(e) => updateApiKey(e.target.value)}
+                placeholder="AIza..."
+                className="w-full bg-panel border border-line rounded-xl px-3 py-2 pr-10 text-sm outline-none focus:border-aperture"
+              />
+              <button
+                type="button"
+                onClick={() => setShowKey((s) => !s)}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-mist hover:text-paper"
+                aria-label={showKey ? "Hide key" : "Show key"}
+              >
+                {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+            <p className="text-xs text-mist">
+              Get a free key from{" "}
+              <a
+                href="https://aistudio.google.com/app/apikey"
+                target="_blank"
+                rel="noreferrer"
+                className="text-aperture underline"
+              >
+                Google AI Studio
+              </a>
+              . Saved only in this browser — sent directly to Google for each generation, never stored on our servers.
+            </p>
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center gap-2">
           {RATIOS.map((r) => (
             <button
