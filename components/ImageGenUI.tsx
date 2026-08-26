@@ -21,6 +21,11 @@ const PROVIDERS = [
     hint: "Slower but follows your prompt much more closely. No API key needed.",
   },
   {
+    id: "huggingface",
+    label: "Flux / SDXL (Hugging Face)",
+    hint: "Runs on Hugging Face's Flux.1-schnell (with SDXL as backup). No key needed from you.",
+  },
+  {
     id: "gemini-byok",
     label: "Gemini (Your API Key)",
     hint: "Uses your own Gemini API key — credits are deducted from your account, not ours.",
@@ -122,6 +127,9 @@ export default function ImageGenUI() {
             ))}
           </select>
           <p className="text-xs text-mist">{activeProvider.hint}</p>
+          <p className="text-xs text-mist/70">
+            Every image, no matter which model you pick, gets a small "Muzammil" watermark in the corner.
+          </p>
         </div>
 
         {/* Gemini API key input, only shown when that provider is selected */}

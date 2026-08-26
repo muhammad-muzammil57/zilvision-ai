@@ -1,22 +1,32 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
+import { watermarkImage } from "@/lib/watermark";
 
 // ---------------------------------------------------------------------------
-// Three providers:
-//  1. "free-fast"     -> Pollinations (flux model). No key.
-//  2. "free-accurate" -> Pollinations (nanobanana, falling back to gptimage,
-//                         falling back to flux if those are overloaded).
-//                         No key needed, best prompt-following of the free
-//                         tiers.
-//  3. "gemini-byok"    -> User's own Gemini API key, called directly.
+// Four providers, all end up going through the same watermark step before
+// being returned to the client:
+//  1. "free-fast"      -> Pollinations (flux model). No key.
+//  2. "free-accurate"  -> Pollinations (nanobanana -> gptimage -> flux
+//                          fallback chain). No key.
+//  3. "huggingface"     -> Hugging Face Inference API (FLUX.1-schnell by
+//                          default). Uses OUR server-side HUGGINGFACE_API_KEY
+//                          from .env — the user never sees or enters a key
+//                          for this one.
+//  4. "gemini-byok"     -> User's own Gemini API key, called directly, their
+//                          own quota/credits are used.
 //
-// IMPORTANT: for the Pollinations providers we fetch the image bytes on the
-// server FIRST and check the response is actually an image before ever
-// telling the client "success". This is what stops the broken-image-icon
-// problem: previously we just handed the browser a URL and hoped for the
-// best, so a 429/403/500 from Pollinations rendered as a broken <img>.
+// Every image, no matter which provider produced it, gets a small
+// "Muzammil" watermark stamped on the bottom-right corner before it's sent
+// back to the browser. We fetch raw bytes server-side (not a bare URL) so
+// we can (a) verify it's actually an image, not an error page, and
+// (b) composite the watermark with sharp.
 // ---------------------------------------------------------------------------
+
+interface RawImage {
+  buffer: Buffer;
+  mimeType: string;
+}
 
 function aspectRatioFor(width: number, height: number) {
   const ratio = width / height;
@@ -34,7 +44,7 @@ async function fetchPollinationsImage(
   seed: number,
   model: string,
   timeoutMs = 45_000
-): Promise<string> {
+): Promise<RawImage> {
   const base = process.env.POLLINATIONS_BASE_URL || "https://image.pollinations.ai/prompt";
   const encoded = encodeURIComponent(prompt.trim());
   const url = `${base}/${encoded}?width=${width}&height=${height}&seed=${seed}&nologo=true&model=${model}`;
@@ -47,7 +57,6 @@ async function fetchPollinationsImage(
     const contentType = res.headers.get("content-type") || "";
 
     if (!res.ok || !contentType.startsWith("image/")) {
-      // Pollinations returns JSON/HTML for errors (rate limit, model down, etc).
       let detail = `status ${res.status}`;
       try {
         const text = await res.text();
@@ -62,7 +71,7 @@ async function fetchPollinationsImage(
     if (buffer.length < 500) {
       throw new Error(`Model "${model}" returned an empty image.`);
     }
-    return `data:${contentType};base64,${buffer.toString("base64")}`;
+    return { buffer, mimeType: contentType };
   } finally {
     clearTimeout(timer);
   }
@@ -73,8 +82,6 @@ async function generateFast(prompt: string, width: number, height: number, seed:
 }
 
 async function generateAccurate(prompt: string, width: number, height: number, seed: number) {
-  // Try the strongest prompt-following model first, then degrade gracefully
-  // instead of surfacing a broken image to the user.
   const chain = ["nanobanana", "gptimage", "flux"];
   let lastError: unknown;
   for (const model of chain) {
@@ -87,7 +94,86 @@ async function generateAccurate(prompt: string, width: number, height: number, s
   throw lastError instanceof Error ? lastError : new Error("All accurate models are unavailable right now.");
 }
 
-async function generateWithGemini(prompt: string, width: number, height: number, apiKey: string) {
+async function callHuggingFaceModel(
+  model: string,
+  apiKey: string,
+  prompt: string,
+  width: number,
+  height: number
+): Promise<RawImage> {
+  const url = `https://api-inference.huggingface.co/models/${model}`;
+
+  const callOnce = () =>
+    fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "image/png",
+      },
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: { width, height },
+      }),
+    });
+
+  let res = await callOnce();
+
+  // Serverless HF models cold-start; a 503 includes an estimated_time to wait.
+  if (res.status === 503) {
+    const info = await res.json().catch(() => ({} as any));
+    const waitMs = Math.min(Math.ceil((info?.estimated_time ?? 12) * 1000), 20_000);
+    await new Promise((r) => setTimeout(r, waitMs));
+    res = await callOnce();
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  if (!res.ok || !contentType.startsWith("image/")) {
+    let detail = `status ${res.status}`;
+    try {
+      const text = await res.text();
+      detail = text.slice(0, 200) || detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(`Hugging Face model "${model}" unavailable right now (${detail}).`);
+  }
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  return { buffer, mimeType: contentType };
+}
+
+async function generateWithHuggingFace(
+  prompt: string,
+  width: number,
+  height: number
+): Promise<RawImage> {
+  const apiKey = process.env.HUGGINGFACE_API_KEY;
+  if (!apiKey) {
+    throw new Error("Hugging Face isn't configured on this server yet (missing HUGGINGFACE_API_KEY).");
+  }
+
+  const primary = process.env.HUGGINGFACE_IMAGE_MODEL || "black-forest-labs/FLUX.1-schnell";
+  const fallback = "stabilityai/stable-diffusion-xl-base-1.0";
+
+  try {
+    return await callHuggingFaceModel(primary, apiKey, prompt, width, height);
+  } catch (primaryErr) {
+    if (primary === fallback) throw primaryErr;
+    try {
+      return await callHuggingFaceModel(fallback, apiKey, prompt, width, height);
+    } catch {
+      throw primaryErr instanceof Error ? primaryErr : new Error("Hugging Face models are unavailable right now.");
+    }
+  }
+}
+
+async function generateWithGemini(
+  prompt: string,
+  width: number,
+  height: number,
+  apiKey: string
+): Promise<RawImage> {
   const model = "gemini-2.5-flash-image";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
@@ -119,7 +205,8 @@ async function generateWithGemini(prompt: string, width: number, height: number,
   }
 
   const mimeType = part.inlineData.mimeType || "image/png";
-  return `data:${mimeType};base64,${part.inlineData.data}`;
+  const buffer = Buffer.from(part.inlineData.data, "base64");
+  return { buffer, mimeType };
 }
 
 export async function POST(req: NextRequest) {
@@ -148,6 +235,8 @@ export async function POST(req: NextRequest) {
     const seedParam = seed ?? Math.floor(Math.random() * 1_000_000);
     const cleanPrompt = prompt.trim();
 
+    let raw: RawImage;
+
     if (provider === "gemini-byok") {
       if (!apiKey || !apiKey.trim()) {
         return NextResponse.json(
@@ -155,17 +244,18 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
-      const imageUrl = await generateWithGemini(cleanPrompt, width, height, apiKey.trim());
-      return NextResponse.json({ imageUrl, provider });
+      raw = await generateWithGemini(cleanPrompt, width, height, apiKey.trim());
+    } else if (provider === "huggingface") {
+      raw = await generateWithHuggingFace(cleanPrompt, width, height);
+    } else if (provider === "free-accurate") {
+      raw = await generateAccurate(cleanPrompt, width, height, seedParam);
+    } else {
+      raw = await generateFast(cleanPrompt, width, height, seedParam);
     }
 
-    if (provider === "free-accurate") {
-      const imageUrl = await generateAccurate(cleanPrompt, width, height, seedParam);
-      return NextResponse.json({ imageUrl, provider });
-    }
+    const watermarked = await watermarkImage(raw.buffer, raw.mimeType);
+    const imageUrl = `data:${watermarked.mime};base64,${watermarked.buffer.toString("base64")}`;
 
-    // default: free-fast
-    const imageUrl = await generateFast(cleanPrompt, width, height, seedParam);
     return NextResponse.json({ imageUrl, provider });
   } catch (err: any) {
     return NextResponse.json(
