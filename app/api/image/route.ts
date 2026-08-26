@@ -9,10 +9,16 @@ import { watermarkImage } from "@/lib/watermark";
 //  1. "free-fast"      -> Pollinations (flux model). No key.
 //  2. "free-accurate"  -> Pollinations (nanobanana -> gptimage -> flux
 //                          fallback chain). No key.
-//  3. "huggingface"     -> Hugging Face Inference API (FLUX.1-schnell by
-//                          default). Uses OUR server-side HUGGINGFACE_API_KEY
-//                          from .env — the user never sees or enters a key
-//                          for this one.
+//  3. "huggingface"     -> Hugging Face, via the official @huggingface/inference
+//                          SDK (talks to router.huggingface.co, the endpoint
+//                          that replaced the now-shut-down
+//                          api-inference.huggingface.co). Uses OUR
+//                          server-side HUGGINGFACE_API_KEY from .env — the
+//                          user never enters a key for this one. NOTE: HF's
+//                          free tier gives a small monthly credit pool for
+//                          image models now (it is no longer unlimited like
+//                          the old serverless Inference API was), so treat
+//                          this as a bonus option, not the main free tier.
 //  4. "gemini-byok"     -> User's own Gemini API key, called directly, their
 //                          own quota/credits are used.
 //
@@ -141,53 +147,33 @@ async function generateAccurate(prompt: string, width: number, height: number, s
   throw lastError instanceof Error ? lastError : new Error("All accurate models are unavailable right now.");
 }
 
-async function callHuggingFaceModel(
-  model: string,
-  apiKey: string,
-  prompt: string,
-  width: number,
-  height: number
-): Promise<RawImage> {
-  const url = `https://api-inference.huggingface.co/models/${model}`;
+async function callHuggingFaceModel(model: string, apiKey: string, prompt: string, width: number, height: number): Promise<RawImage> {
+  // The official SDK talks to https://router.huggingface.co (the endpoint that
+  // replaced the now-shut-down api-inference.huggingface.co) and picks a
+  // working Inference Provider automatically.
+  const { InferenceClient } = await import("@huggingface/inference");
+  const client = new InferenceClient(apiKey);
 
-  const callOnce = () =>
-    safeFetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        Accept: "image/png",
-      },
-      body: JSON.stringify({
+  let blob: Blob;
+  try {
+    blob = await client.textToImage(
+      {
+        model,
+        provider: "auto",
         inputs: prompt,
         parameters: { width, height },
-      }),
-    });
-
-  let res = await callOnce();
-
-  // Serverless HF models cold-start; a 503 includes an estimated_time to wait.
-  if (res.status === 503) {
-    const info = await res.json().catch(() => ({} as any));
-    const waitMs = Math.min(Math.ceil((info?.estimated_time ?? 12) * 1000), 20_000);
-    await new Promise((r) => setTimeout(r, waitMs));
-    res = await callOnce();
+      },
+      { outputType: "blob" }
+    );
+  } catch (err: any) {
+    throw new Error(`Hugging Face model "${model}" failed: ${err?.message || "unknown error"}.`);
   }
 
-  const contentType = res.headers.get("content-type") || "";
-  if (!res.ok || !contentType.startsWith("image/")) {
-    let detail = `status ${res.status}`;
-    try {
-      const text = await res.text();
-      detail = text.slice(0, 200) || detail;
-    } catch {
-      // ignore
-    }
-    throw new Error(`Hugging Face model "${model}" unavailable right now (${detail}).`);
+  const buffer = Buffer.from(await blob.arrayBuffer());
+  if (buffer.length < 500) {
+    throw new Error(`Hugging Face model "${model}" returned an empty image.`);
   }
-
-  const buffer = Buffer.from(await res.arrayBuffer());
-  return { buffer, mimeType: contentType };
+  return { buffer, mimeType: blob.type || "image/png" };
 }
 
 async function generateWithHuggingFace(
@@ -200,8 +186,8 @@ async function generateWithHuggingFace(
     throw new Error("Hugging Face isn't configured on this server yet (missing HUGGINGFACE_API_KEY).");
   }
 
-  const primary = process.env.HUGGINGFACE_IMAGE_MODEL || "black-forest-labs/FLUX.1-schnell";
-  const fallback = "stabilityai/stable-diffusion-xl-base-1.0";
+  const primary = process.env.HUGGINGFACE_IMAGE_MODEL || "black-forest-labs/FLUX.1-dev";
+  const fallback = "black-forest-labs/FLUX.1-schnell";
 
   try {
     return await callHuggingFaceModel(primary, apiKey, prompt, width, height);

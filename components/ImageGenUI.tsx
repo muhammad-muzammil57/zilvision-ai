@@ -22,8 +22,8 @@ const PROVIDERS = [
   },
   {
     id: "huggingface",
-    label: "Flux / SDXL (Hugging Face)",
-    hint: "Runs on Hugging Face's Flux.1-schnell (with SDXL as backup). No key needed from you.",
+    label: "Flux (Hugging Face)",
+    hint: "Runs on Hugging Face. No key needed from you, but this uses a small shared monthly credit pool, so it may run out before the free options do.",
   },
   {
     id: "gemini-byok",
