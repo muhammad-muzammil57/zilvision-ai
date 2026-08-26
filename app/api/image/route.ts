@@ -28,6 +28,53 @@ interface RawImage {
   mimeType: string;
 }
 
+// Node's fetch throws a bare "fetch failed" for any network-level problem
+// (DNS, connection refused, timeout, TLS...). That's useless to debug from,
+// so we unwrap `err.cause` (where Node/undici puts the real reason) and
+// turn it into something actionable.
+async function safeFetch(url: string, options?: RequestInit): Promise<Response> {
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    // ignore, keep raw url as host label
+  }
+
+  try {
+    return await fetch(url, options);
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      throw new Error(`Request to ${host} timed out. It may be slow, blocked, or unreachable from this server.`);
+    }
+
+    const cause = err?.cause;
+    const code = cause?.code || cause?.errno;
+    let reason: string;
+    switch (code) {
+      case "ENOTFOUND":
+      case "EAI_AGAIN":
+        reason = `Could not resolve ${host} (DNS lookup failed). The server likely has no internet/DNS access, or ${host} is blocked at the network level.`;
+        break;
+      case "ECONNREFUSED":
+        reason = `Connection to ${host} was refused. A firewall, VPN, or hosting network policy is probably blocking outbound requests to this host.`;
+        break;
+      case "ETIMEDOUT":
+      case "UND_ERR_CONNECT_TIMEOUT":
+      case "UND_ERR_HEADERS_TIMEOUT":
+        reason = `Connection to ${host} timed out with no response — likely blocked or throttled by your network/ISP/hosting provider.`;
+        break;
+      case "CERT_HAS_EXPIRED":
+      case "ERR_TLS_CERT_ALTNAME_INVALID":
+      case "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+        reason = `TLS/certificate error while connecting to ${host}.`;
+        break;
+      default:
+        reason = `Could not reach ${host}: ${cause?.message || err?.message || "unknown network error"}${code ? ` (${code})` : ""}.`;
+    }
+    throw new Error(reason);
+  }
+}
+
 function aspectRatioFor(width: number, height: number) {
   const ratio = width / height;
   if (Math.abs(ratio - 1) < 0.05) return "1:1";
@@ -53,7 +100,7 @@ async function fetchPollinationsImage(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await safeFetch(url, { signal: controller.signal });
     const contentType = res.headers.get("content-type") || "";
 
     if (!res.ok || !contentType.startsWith("image/")) {
@@ -104,7 +151,7 @@ async function callHuggingFaceModel(
   const url = `https://api-inference.huggingface.co/models/${model}`;
 
   const callOnce = () =>
-    fetch(url, {
+    safeFetch(url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -177,7 +224,7 @@ async function generateWithGemini(
   const model = "gemini-2.5-flash-image";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-  const res = await fetch(url, {
+  const res = await safeFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
